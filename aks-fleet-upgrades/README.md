@@ -3,79 +3,222 @@
 ## Cluster Setup
 
 ```bash
-RG=EphFleetUpgradeDem0
+# Setup environment
+RG=eph-rg-fleet-upgrade-demo
 LOC=eastus2
-FLEET=fleetlab
+FLEET=fleetdemo
+CLUSTERS_LIST="dev-canary dev test-canary test stg-canary stg prd"
+UPDATE_STRATEGY_NAME=staged-update-strategy-cli
+AUTOUPGRADE_PROFILE_NAME=autoupgrade-profile-name-cli
 
 # Create the resource group
 az group create -g $RG -l $LOC
 
+# Create some AKS clusters
+for cluster_name in $CLUSTERS_LIST
+do
+  az aks create -g $RG -n $cluster_name -c 1 --no-wait
+done
+
+# Get credentials to access clusters
+do
+  az aks get-credentials -g $RG -n $cluster_name
+done
+```
+
+## Fleet Setup
+
+```bash
+az extension add --name fleet
+az extension update --name fleet
+
 # Create the fleet
 az fleet create --resource-group $RG --name ${FLEET} --location $LOC
 
-# Create some AKS clusters
-az aks create -g $RG -n dev-canary -c 1 --no-wait
-az aks create -g $RG -n dev -c 1 --no-wait
-az aks create -g $RG -n test-canary -c 1 --no-wait
-az aks create -g $RG -n test -c 1 --no-wait
-az aks create -g $RG -n stg-canary -c 1 --no-wait
-az aks create -g $RG -n stg -c 1 --no-wait
-az aks create -g $RG -n prd -c 1 --no-wait
+# Add members (clusters) to fleet
+for cluster_name in $CLUSTERS_LIST
+do
+  az fleet member create \
+  --resource-group $RG \
+  --fleet-name $FLEET \
+  --name $cluster_name \
+  --member-cluster-id $(az aks show -g $RG -n $cluster_name --query id -o tsv) \
+  --no-wait
+done
+```
 
-az fleet member create \
+## Upgrade Setup
+
+### Current versions and target versions
+```bash
+# See what versions clusters are running and what are available
+
+az aks list -g $RG -o table
+az aks get-versions --location $LOC --output table
+
+# Version to upgrade clusters
+TARGET_K8S_VERSION="1.32.1"
+```
+
+### Assign clusters to Update Groups
+
+```bash
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
 --name dev-canary \
---member-cluster-id $(az aks show -g $RG -n dev-canary --query id -o tsv) \
---no-wait
+--update-group dev-canary
 
-az fleet member create \
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
 --name dev \
---member-cluster-id $(az aks show -g $RG -n dev --query id -o tsv) \
---no-wait
+--update-group dev
 
-az fleet member create \
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
---name test-canary \
---member-cluster-id $(az aks show -g $RG -n test-canary --query id -o tsv) \
---no-wait
+--name tst-canary \
+--update-group test
 
-az fleet member create \
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
---name test \
---member-cluster-id $(az aks show -g $RG -n test --query id -o tsv) \
---no-wait
+--name tst \
+--update-group test
 
-az fleet member create \
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
 --name stg-canary \
---member-cluster-id $(az aks show -g $RG -n stg-canary --query id -o tsv) \
---no-wait
+--update-group stage
 
-az fleet member create \
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
 --name stg \
---member-cluster-id $(az aks show -g $RG -n stg --query id -o tsv) \
---no-wait
+--update-group stage
 
-az fleet member create \
+az fleet member update \
 --resource-group $RG \
 --fleet-name $FLEET \
---name prd \
---member-cluster-id $(az aks show -g $RG -n prd --query id -o tsv) \
---no-wait
+--name prod \
+--update-group prod
+```
 
-az aks get-credentials -g $RG -n dev-canary
-az aks get-credentials -g $RG -n dev
-az aks get-credentials -g $RG -n test-canary
-az aks get-credentials -g $RG -n test
-az aks get-credentials -g $RG -n stg-canary
-az aks get-credentials -g $RG -n stg
-az aks get-credentials -g $RG -n prd
+### Create an Update Strategy
+```bash
+# Create a stages JSON file
+cat <<EOF > stages.json
+{
+    "stages": [
+        {
+            "name": "canary-group",
+            "groups": [
+                {
+                    "name": "dev-canary"
+                },
+                {
+                    "name": "tst-canary"
+                },
+                {
+                    "name": "stg-canary"
+                }
+            ],
+            "afterStageWaitInSeconds": 30
+        },
+        {
+            "name": "dev-group",
+            "groups": [
+                {
+                    "name": "dev"
+                }
+            ],
+            "afterStageWaitInSeconds": 30
+        },
+        {
+            "name": "test-group",
+            "groups": [
+                {
+                    "name": "tst"
+                }
+            ],
+            "afterStageWaitInSeconds": 30
+        },
+        {
+            "name": "stage-group",
+            "groups": [
+                {
+                    "name": "stg"
+                }
+            ],
+            "afterStageWaitInSeconds": 30
+        },
+        {
+            "name": "prod-group",
+            "groups": [
+                {
+                    "name": "prod"
+                }
+            ]
+        }
+    ]
+}
+EOF
+
+# Create the update strategy
+az fleet updatestrategy create \
+--resource-group $RG \
+--fleet-name $FLEET \
+--name $UPDATE_STRATEGY_NAME \
+--stages stages.json
+
+# Grab the resource ID for the update strategy
+STRATEGY_ID=$(az fleet updatestrategy show -g $RG -f $FLEET -n $UPDATE_STRATEGY_NAME --query id -o tsv)
+```
+
+### Option: Create an Auto-Upgrade Profile using the Update Strategy
+```bash
+az fleet autoupgradeprofile create \
+--resource-group $RG \
+--fleet-name $FLEET \
+--name $AUTOUPGRADE_PROFILE_NAME \
+--channel Stable \
+--update-strategy-id $STRATEGY_ID
+```
+
+## Run an Upgrade
+
+> **IMPORTANT**: If the cluster members have *planned maintenance windows* they will be honored. Your runs may be `Pending` until the planned maintenance window opens.
+
+### Option: Manually trigger an Auto-Upgrade Profile run (versus waiting for a channel trigger)
+```bash
+az fleet autoupgradeprofile generate-update-run \
+--resource-group $RG \
+--fleet-name $FLEET \
+--name $AUTOUPGRADE_PROFILE_NAME
+```
+
+### Option: Manually trigger a run from an Update Strategy
+```bash
+az fleet updaterun create \
+--resource-group $RG \
+--fleet-name $FLEET \
+--name test-run-manual-from-strategy-cli \
+--upgrade-type Full \
+--kubernetes-version TARGET_K8S_VERSION \
+--node-image-selection Latest \
+--update-strategy-name $UPDATE_STRATEGY_NAME
+```
+
+### Option: Manually trigger a run from a stages specification file
+```bash
+az fleet updaterun create \
+--resource-group $RG \
+--fleet-name $FLEET \
+--name test-run-manual-from-stages \
+--upgrade-type Full \
+--kubernetes-version TARGET_K8S_VERSION \
+--node-image-selection Latest \
+--stages stages.json
 ```
